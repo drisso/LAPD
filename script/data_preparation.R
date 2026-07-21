@@ -426,3 +426,50 @@ prepare_hurdle_analysis_data <- function(
     shape = trial_data$shape
   )
 }
+
+make_data_long <- function(
+    S,
+    frames,
+    frame_indices = seq_len(nrow(frames)),
+    neuron_indices = seq_len(nrow(S))
+) {
+  require_namespace("data.table")
+  frame_indices <- as.integer(frame_indices)
+  neuron_indices <- as.integer(neuron_indices)
+
+  wide <- data.table::as.data.table(t(S[neuron_indices, frame_indices, drop = FALSE]))
+  data.table::setnames(wide, as.character(neuron_indices))
+  wide[, frame_row := seq_len(.N)]
+  long <- data.table::melt(
+    wide,
+    id.vars = "frame_row",
+    variable.name = "neuron_index",
+    value.name = "amplitude",
+    variable.factor = FALSE
+  )
+  rm(wide)
+  long[, neuron_index := as.integer(neuron_index)]
+  long[!is.finite(amplitude) | amplitude < 0, amplitude := 0]
+  long[, threshold := 0]
+  long[, event := as.integer(amplitude > 0)]
+  long[, neuron := factor(
+    paste0("n", neuron_index),
+    levels = paste0("n", neuron_indices)
+  )]
+
+  frame_subset <- frames[frame_indices, , drop = FALSE]
+  covariate_names <- c(
+    "frame", "time_sec", "x", "y", "border_distance", "speed",
+    "x_z", "y_z", "border_z", "speed_z", "time_z", "set"
+  )
+  for (variable in covariate_names) {
+    long[, (variable) := frame_subset[[variable]][frame_row]]
+  }
+  long[, frame_row := NULL]
+  data.table::setcolorder(long, c(
+    "frame", "time_sec", "neuron", "neuron_index", "event", "amplitude",
+    "threshold", "x", "y", "border_distance", "speed",
+    "x_z", "y_z", "border_z", "speed_z", "time_z", "set"
+  ))
+  long[]
+}
