@@ -1,0 +1,440 @@
+---
+title: "Hurdle GAM for deconvolved calcium events"
+subtitle: "First task of the first mouse"
+author: "LAPD"
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  holdout_seconds: 30
+  threshold_method: "three_sd"
+  n_neurons: null
+  nthreads: 2
+  max_diagnostic_rows: 500000
+  cache_trial: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(fig.align = "center")
+
+required_packages <- c("data.table", "ggplot2", "knitr", "mgcv")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install the following packages before rendering: ",
+       paste(missing_packages, collapse = ", "))
+}
+
+library(ggplot2)
+
+# Quarto normally evaluates relative to this file's directory. The fallback
+# also permits executing the chunks interactively from the repository root.
+root_candidates <- c("..", ".")
+root_matches <- root_candidates[
+  file.exists(file.path(root_candidates, "all_trials.RDS"))
+]
+if (!length(root_matches)) stop("Could not locate all_trials.RDS.")
+project_root <- normalizePath(root_matches[1L])
+
+source(file.path(project_root, "script", "data_preparation.R"))
+source(file.path(project_root, "script", "hurdle_gam.R"))
+source(file.path(project_root, "script", "model_diagnostics.R"))
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Objective and data
+
+The response is the deconvolved spike estimate $S_{it}$ for neuron $i$ at calcium frame $t$. It is a sparse, nonnegative estimate produced from calcium fluorescence rather than a directly observed action-potential train. We therefore call a threshold crossing a **calcium event**, not a known physiological spike.
+
+The first mouse is `M3411`, and its first task is `trial1`, a triangular-arena trial. It contains 462 neurons and approximately 10,870 calcium frames at 15 Hz. Behavioral positions were recorded at approximately 30 Hz. The timestamps stored under `neuron$time` describe the original acquisition clock and are not one-to-one with the columns of `S`; consequently, we construct a calcium-frame time grid over the recording interval and linearly interpolate behavior onto it.
+
+The source RDS is a large nested object. On the first execution, the following chunk reads it and saves only the selected trial in `analysis/cache`. Later renders use that much smaller cache. Delete the cached file if the source data change.
+
+```{r}
+#| label: load-trial
+
+cache_path <- if (isTRUE(params$cache_trial)) {
+  file.path(project_root, "analysis", "cache", "M3411_trial1.rds")
+} else {
+  NULL
+}
+
+trial_data <- load_trial_data(
+  rds_path = file.path(project_root, "all_trials.RDS"),
+  mouse = 1L,
+  trial = 1L,
+  cache_path = cache_path
+)
+
+data.frame(
+  mouse = trial_data$mouse_name,
+  trial = trial_data$trial_name,
+  arena = trial_data$shape,
+  neurons = nrow(trial_data$neuron$S),
+  calcium_frames = ncol(trial_data$neuron$S),
+  behaviour_observations = nrow(trial_data$behav$position)
+) |>
+  knitr::kable(caption = "Selected recording")
+```
+
+## Temporal split and event definition
+
+The last `r params$holdout_seconds` seconds are held out. This is deliberately harder and more realistic than randomly holding out individual rows: nearby frames are strongly dependent, and a random split would leak almost identical behavioral states into both sets.
+
+For the default event definition, the threshold for neuron $i$ is estimated from training frames only:
+
+$$
+c_i = 3\,\operatorname{SD}_{t\in\mathcal T_{\mathrm{train}}}(S_{it}),
+\qquad
+Y_{it}=\mathbb{1}(S_{it}>c_i).
+$$
+
+This follows the three-standard-deviation rule described in the experimental paper. Both the threshold and all covariate standardization constants are calculated without using the terminal holdout. The conditional amplitude response is the original $S_{it}$ on frames for which $Y_{it}=1$.
+
+```{r}
+#| label: prepare-data
+
+all_neurons <- seq_len(nrow(trial_data$neuron$S))
+neuron_indices <- if (is.null(params$n_neurons)) {
+  all_neurons
+} else {
+  head(all_neurons, as.integer(params$n_neurons))
+}
+
+analysis_data <- prepare_hurdle_analysis_data(
+  trial_data = trial_data,
+  holdout_seconds = params$holdout_seconds,
+  threshold_method = params$threshold_method,
+  neuron_indices = neuron_indices
+)
+
+train_data <- analysis_data$train
+test_data <- analysis_data$test
+
+split_summary <- rbind(
+  data.frame(
+    set = "Training",
+    frames = data.table::uniqueN(train_data$frame),
+    observations = nrow(train_data),
+    events = sum(train_data$event),
+    event_rate = mean(train_data$event),
+    start_sec = min(train_data$time_sec),
+    end_sec = max(train_data$time_sec)
+  ),
+  data.frame(
+    set = "Terminal holdout",
+    frames = data.table::uniqueN(test_data$frame),
+    observations = nrow(test_data),
+    events = sum(test_data$event),
+    event_rate = mean(test_data$event),
+    start_sec = min(test_data$time_sec),
+    end_sec = max(test_data$time_sec)
+  )
+)
+knitr::kable(split_summary, digits = 4, caption = "Analysis split and event prevalence")
+```
+
+## Behavioral covariates and arena boundary
+
+Let $(x_t,y_t)$ be the interpolated mouse position, $d_t$ its Euclidean distance from the nearest estimated triangle edge, and $v_t$ its smoothed displacement per second in the coordinate system of the tracking camera. The triangle is estimated from training positions only. Values are standardized using training means and standard deviations before fitting.
+
+Distance to the boundary is a deterministic spatial summary and is therefore related to the bivariate position term below. We retain both to estimate a directly interpretable boundary effect after accounting for broader spatial variation, but inspect concurvity after fitting. A high concurvity value means the separate effects should not be interpreted in isolation.
+
+```{r}
+#| label: arena-check
+#| fig-cap: "Aligned trajectory and triangle boundary estimated from training positions. The red segment is the terminal holdout."
+
+boundary_df <- boundary_dataframe(analysis_data$boundary)
+frames <- analysis_data$frames
+
+ggplot(frames, aes(x, y)) +
+  geom_path(aes(color = set), linewidth = 0.25, alpha = 0.65) +
+  geom_path(data = boundary_df, inherit.aes = FALSE, aes(x, y),
+            linewidth = 1, color = "black") +
+  scale_color_manual(values = c(train = "grey55", test = "#D55E00"),
+                     labels = c(train = "Training", test = "Terminal holdout")) +
+  coord_equal() +
+  labs(x = "Position x", y = "Position y", color = NULL)
+```
+
+# Statistical model
+
+The hurdle model has two components. First, event occurrence follows a binomial GAM:
+
+$$
+Y_{it}\mid p_{it}\sim\operatorname{Bernoulli}(p_{it}),
+$$
+
+$$
+\operatorname{logit}(p_{it})=
+\beta_0+b_i+f_{xy}(x_t,y_t)+f_d(d_t)+f_v(v_t)+f_T(T_t).
+$$
+
+Here $b_i\sim N(0,\sigma_b^2)$ is a penalized neuron random intercept. The bivariate smooth $f_{xy}$ captures population-level spatial variation that is not reducible to distance from the wall. The univariate smooths describe boundary distance, movement speed, and gradual change over trial time. The time term can capture drift or behavioral nonstationarity, but predictions in the terminal holdout necessarily extrapolate this term slightly beyond the training range.
+
+Second, the positive deconvolution amplitude follows a Gamma GAM with a log link:
+
+$$
+S_{it}\mid(S_{it}>c_i),\mu_{it},\phi
+\sim\operatorname{Gamma}(\mu_{it},\phi),
+$$
+
+$$
+\log(\mu_{it})=
+\alpha_0+u_i+g_{xy}(x_t,y_t)+g_d(d_t)+g_v(v_t)+g_T(T_t),
+$$
+
+where the Gamma distribution is parameterized by its mean and dispersion. The two linear predictors have the same structure but are estimated independently. They need not have the same smooth shapes or smoothing strengths.
+
+The implied conditional mean of the thresholded response
+
+$$
+S^*_{it}=S_{it}\mathbb{1}(S_{it}>c_i)
+$$
+
+is
+
+$$
+\operatorname{E}(S^*_{it}\mid\mathbf x_t,i)=p_{it}\mu_{it}.
+$$
+
+This is a marginal regression model. It does not assert independence of the underlying neurons and does not identify directed neuronal interactions. The blocked holdout partly protects predictive assessment from temporal dependence, but conventional GAM standard errors may still be optimistic.
+
+# Model fitting
+
+The models are fitted with `mgcv::bam()`, using fast restricted maximum likelihood, discretized covariates, shrinkage selection, and low-rank smooth bases. These choices are intended to make the pooled model practical on a laptop. The positive component uses only detected training events and is therefore much smaller than the occurrence component.
+
+```{r}
+#| label: fit-model
+
+formulas <- default_hurdle_formulas(
+  position_k = 50L,
+  border_k = 8L,
+  speed_k = 8L,
+  time_k = 12L
+)
+
+hurdle_fit <- fit_hurdle_gam(
+  train_data,
+  formulas = formulas,
+  nthreads = params$nthreads
+)
+
+hurdle_fit
+```
+
+```{r}
+#| label: model-summary
+
+hurdle_model_summary(hurdle_fit) |>
+  transform(
+    adjusted_r_squared = round(adjusted_r_squared, 4),
+    deviance_explained = round(deviance_explained, 4)
+  ) |>
+  knitr::kable(caption = "Model-level in-sample summaries")
+```
+
+Deviance explained is an in-sample descriptive measure, not an estimate of generalization. With rare events, even a useful occurrence model can have modest deviance explained.
+
+```{r}
+#| label: concurvity
+
+occurrence_concurvity <- mgcv::concurvity(hurdle_fit$occurrence, full = TRUE)
+concurvity_table <- data.frame(
+  term = colnames(occurrence_concurvity),
+  worst = as.numeric(occurrence_concurvity["worst", ]),
+  observed = as.numeric(occurrence_concurvity["observed", ]),
+  estimate = as.numeric(occurrence_concurvity["estimate", ])
+)
+knitr::kable(
+  concurvity_table,
+  digits = 3,
+  caption = "Concurvity diagnostics for the occurrence model"
+)
+```
+
+# In-sample goodness of fit
+
+To keep prediction and plotting memory bounded, proper scores and calibration are calculated on a fixed uniform sample of at most `r format(params$max_diagnostic_rows, big.mark = ",")` training rows. Uniform sampling preserves the event prevalence. The fitted-model deviance summaries above use the complete training set.
+
+The comparison baseline assigns each neuron its smoothed training event rate and its mean positive training amplitude; it contains no position, speed, boundary, or time information. A useful GAM should outperform this neuron-only baseline.
+
+```{r}
+#| label: training-predictions
+
+baseline_fit <- fit_neuron_baseline(train_data)
+train_diagnostic <- sample_diagnostic_rows(
+  train_data,
+  max_rows = params$max_diagnostic_rows
+)
+train_diagnostic <- add_hurdle_predictions(hurdle_fit, train_diagnostic)
+train_diagnostic <- add_baseline_predictions(train_diagnostic, baseline_fit)
+
+training_metrics <- evaluate_hurdle_predictions(
+  train_diagnostic,
+  set_label = "Training sample"
+)
+knitr::kable(
+  training_metrics,
+  digits = 5,
+  caption = "In-sample predictive fit on a uniform diagnostic sample"
+)
+```
+
+## Event calibration
+
+A calibrated event model has mean observed event frequency close to mean predicted probability. The bins below contain approximately equal numbers of neuron-frame observations. Because events are rare, both axes focus on small probabilities.
+
+```{r}
+#| label: training-calibration
+#| fig-cap: "In-sample calibration of calcium-event probabilities."
+
+train_calibration <- calibration_table(
+  train_diagnostic$event,
+  train_diagnostic$event_probability,
+  n_bins = 10L
+)
+
+ggplot(train_calibration, aes(predicted, observed)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey45") +
+  geom_point(aes(size = n), color = "#0072B2") +
+  geom_line(color = "#0072B2") +
+  coord_equal() +
+  labs(x = "Mean predicted probability", y = "Observed event frequency", size = "Rows")
+```
+
+## Population activity over an in-sample interval
+
+The next plot uses the last minute of the training period and averages across neurons within one-second bins. It checks whether the fitted marginal model follows broad changes in population event rate without requiring it to reproduce individual event times exactly.
+
+```{r}
+#| label: training-time-fit
+#| fig-cap: "Observed and fitted population event rates during the last minute of training."
+
+training_end <- max(train_data$time_sec)
+train_tail <- train_data[train_data$time_sec >= training_end - 60, ]
+train_tail <- add_hurdle_predictions(hurdle_fit, train_tail)
+train_time <- population_time_summary(train_tail, bin_seconds = 1)
+train_time_long <- rbind(
+  data.frame(time_sec = train_time$time_sec, rate = train_time$observed_event_rate,
+             series = "Observed"),
+  data.frame(time_sec = train_time$time_sec, rate = train_time$predicted_event_rate,
+             series = "Fitted")
+)
+
+ggplot(train_time_long, aes(time_sec, rate, color = series)) +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = c(Observed = "black", Fitted = "#0072B2")) +
+  labs(x = "Trial time (seconds)", y = "Mean event rate", color = NULL)
+```
+
+## Spatial goodness of fit
+
+Observed and fitted event rates are averaged within spatial bins. Empty or rarely visited bins are omitted from visual emphasis by mapping their sample size to opacity.
+
+```{r}
+#| label: spatial-fit
+#| fig-cap: "Observed and fitted in-sample event rates across the arena."
+
+spatial_fit <- spatial_fit_summary(train_diagnostic, n_bins = 15L)
+spatial_fit_long <- rbind(
+  data.frame(spatial_fit[, c("x", "y", "n")], rate = spatial_fit$observed,
+             quantity = "Observed"),
+  data.frame(spatial_fit[, c("x", "y", "n")], rate = spatial_fit$predicted,
+             quantity = "Fitted")
+)
+
+ggplot(spatial_fit_long, aes(x, y, color = rate, alpha = n)) +
+  geom_point(size = 3) +
+  facet_wrap(~quantity) +
+  scale_color_viridis_c() +
+  scale_alpha(range = c(0.25, 1), guide = "none") +
+  coord_equal() +
+  labs(x = "Position x", y = "Position y", color = "Event rate")
+```
+
+# Out-of-sample terminal prediction
+
+No part of the terminal holdout was used to estimate event thresholds, the arena boundary, scaling constants, smooths, random effects, or baseline rates. The test therefore asks whether relationships learned earlier in the same task continue to predict the final `r params$holdout_seconds` seconds. It is a within-neuron, within-task assessment; it does not establish generalization to a new neuron, arena, trial, or mouse.
+
+```{r}
+#| label: test-predictions
+
+test_predictions <- add_hurdle_predictions(hurdle_fit, test_data)
+test_predictions <- add_baseline_predictions(test_predictions, baseline_fit)
+
+test_metrics <- evaluate_hurdle_predictions(
+  test_predictions,
+  set_label = "Terminal holdout"
+)
+knitr::kable(
+  test_metrics,
+  digits = 5,
+  caption = "Out-of-sample performance on the terminal holdout"
+)
+```
+
+For event occurrence, higher AUC is better, while lower Brier score and log loss are better. AUC measures ranking but not probability calibration; Brier score and log loss are proper scoring rules. For positive and thresholded amplitudes, lower RMSE and MAE are better. The thresholded-amplitude prediction $\widehat p_{it}\widehat\mu_{it}$ evaluates both hurdle components jointly.
+
+```{r}
+#| label: test-calibration
+#| fig-cap: "Out-of-sample event-probability calibration in the terminal holdout."
+
+test_calibration <- calibration_table(
+  test_predictions$event,
+  test_predictions$event_probability,
+  n_bins = 10L
+)
+
+ggplot(test_calibration, aes(predicted, observed)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey45") +
+  geom_point(aes(size = n), color = "#D55E00") +
+  geom_line(color = "#D55E00") +
+  coord_equal() +
+  labs(x = "Mean predicted probability", y = "Observed event frequency", size = "Rows")
+```
+
+```{r}
+#| label: test-time-prediction
+#| fig-cap: "Observed and out-of-sample predicted population event rates in the terminal holdout."
+
+test_time <- population_time_summary(test_predictions, bin_seconds = 1)
+test_time_long <- rbind(
+  data.frame(time_sec = test_time$time_sec, rate = test_time$observed_event_rate,
+             series = "Observed"),
+  data.frame(time_sec = test_time$time_sec, rate = test_time$predicted_event_rate,
+             series = "Predicted")
+)
+
+ggplot(test_time_long, aes(time_sec, rate, color = series)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c(Observed = "black", Predicted = "#D55E00")) +
+  labs(x = "Trial time (seconds)", y = "Mean event rate", color = NULL)
+```
+
+# Interpretation and limitations
+
+The most important comparison is between the hurdle GAM and the neuron-only baseline on the terminal holdout. Improvement there indicates that position, boundary distance, speed, and gradual time variation add predictive information beyond stable differences in each neuron's event rate and amplitude.
+
+Several limitations remain:
+
+1. `S` and its positive amplitudes are deconvolution estimates, so coefficient shapes describe the preprocessing output and should not be interpreted as exact firing-rate or burst-size effects.
+2. The common spatial smooth estimates population-average modulation. It does not capture a separate place field for every neuron. Neuron-specific spatial smooths are a possible extension but are much larger and require careful regularization.
+3. The model does not explicitly represent residual coactivation among neurons. Its uncertainty estimates can therefore be too narrow even when blocked predictive performance is reasonable.
+4. Position and border distance are mathematically related. Strong concurvity weakens attempts to attribute a pattern uniquely to one of these two terms.
+5. This terminal split tests persistence over time within one recording. Generalization across repeated tasks, days, and mice requires a separate hierarchical validation design.
+
+The next useful extension is a discrete-time, Hawkes-inspired predictor based on lagged, distance-weighted activity of other neurons. It should be evaluated by whether it improves the same terminal-block scores after all behavioral covariates in this model are included.
