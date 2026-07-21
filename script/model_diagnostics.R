@@ -1,5 +1,101 @@
 # Prediction metrics, baselines, and diagnostic summaries for hurdle GAMs.
 
+sampled_concurvity <- function(
+    model,
+    newdata,
+    max_rows = 20000L,
+    seed = 2026L,
+    exclude_pattern = NULL
+) {
+  if (!inherits(model, "gam")) {
+    stop("model must inherit from class 'gam'.", call. = FALSE)
+  }
+  if (!nrow(newdata)) stop("newdata has no rows.", call. = FALSE)
+
+  # mgcv::concurvity() constructs the complete fitted-model matrix. For a
+  # multi-million-row bam fit, its internal integer dimension calculation can
+  # overflow. A sampled linear-predictor matrix estimates the same geometric
+  # diagnostic while keeping the dimensions bounded.
+  if (nrow(newdata) > max_rows) {
+    set.seed(seed)
+    row_index <- sort(sample.int(nrow(newdata), max_rows))
+    diagnostic_data <- newdata[row_index, , drop = FALSE]
+  } else {
+    diagnostic_data <- newdata
+  }
+  X_full <- stats::predict(model, newdata = diagnostic_data, type = "lpmatrix")
+  valid <- rowSums(is.na(X_full)) == 0
+  X_full <- X_full[valid, , drop = FALSE]
+
+  smooth_labels <- vapply(model$smooth, `[[`, character(1), "label")
+  keep_smooth <- rep(TRUE, length(model$smooth))
+  if (!is.null(exclude_pattern)) {
+    keep_smooth <- !grepl(exclude_pattern, smooth_labels)
+  }
+  kept <- which(keep_smooth)
+  if (!length(kept)) stop("No smooth terms remain for the diagnostic.", call. = FALSE)
+
+  first_smooth_column <- min(vapply(model$smooth, `[[`, numeric(1), "first.para"))
+  groups <- list()
+  if (first_smooth_column > 1L) {
+    groups$para <- seq_len(first_smooth_column - 1L)
+  }
+  for (i in kept) {
+    groups[[smooth_labels[i]]] <-
+      model$smooth[[i]]$first.para:model$smooth[[i]]$last.para
+  }
+
+  selected_columns <- unlist(groups, use.names = FALSE)
+  X <- X_full[, selected_columns, drop = FALSE]
+  beta <- stats::coef(model)[selected_columns]
+  rm(X_full, diagnostic_data)
+
+  if (nrow(X) <= ncol(X)) {
+    stop(
+      "The concurvity sample must contain more rows than model columns; ",
+      "increase max_rows.",
+      call. = FALSE
+    )
+  }
+  X <- qr.R(qr(X, tol = 0, LAPACK = FALSE))
+  group_lengths <- lengths(groups)
+  stops <- cumsum(group_lengths)
+  starts <- stops - group_lengths + 1L
+  result <- matrix(
+    0,
+    nrow = 3L,
+    ncol = length(groups),
+    dimnames = list(c("worst", "observed", "estimate"), names(groups))
+  )
+
+  for (i in seq_along(groups)) {
+    target <- starts[i]:stops[i]
+    other <- setdiff(seq_len(ncol(X)), target)
+    Xi <- X[, other, drop = FALSE]
+    Xj <- X[, target, drop = FALSE]
+    r <- ncol(Xi)
+    R <- qr.R(qr(cbind(Xi, Xj), LAPACK = FALSE, tol = 0))[
+      , -(seq_len(r)), drop = FALSE
+    ]
+    Rt <- qr.R(qr(R, tol = 0))
+    target_beta <- beta[target]
+    result["worst", i] <-
+      svd(forwardsolve(t(Rt), t(R[seq_len(r), , drop = FALSE])))$d[1L]^2
+    denominator <- sum((Rt %*% target_beta)^2)
+    result["observed", i] <- if (denominator > 0) {
+      sum((R[seq_len(r), , drop = FALSE] %*% target_beta)^2) / denominator
+    } else {
+      NA_real_
+    }
+    result["estimate", i] <-
+      sum(R[seq_len(r), , drop = FALSE]^2) / sum(R^2)
+  }
+
+  attr(result, "sample_rows") <- sum(valid)
+  attr(result, "excluded_smooths") <- smooth_labels[!keep_smooth]
+  result
+}
+
 binary_auc <- function(observed, predicted) {
   keep <- is.finite(observed) & is.finite(predicted)
   observed <- observed[keep]

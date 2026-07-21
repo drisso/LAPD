@@ -13,18 +13,21 @@ execute:
   echo: true
   warning: false
   message: false
-params:
-  holdout_seconds: 30
-  threshold_method: "three_sd"
-  n_neurons: null
-  nthreads: 2
-  max_diagnostic_rows: 500000
-  cache_trial: true
 ---
 
 ```{r}
 #| label: setup
 #| include: false
+
+params <- list(
+  holdout_seconds = 30,
+  threshold_method = "three_sd",
+  n_neurons = NULL,
+  nthreads = 2,
+  max_diagnostic_rows = 500000,
+  concurvity_rows = 20000,
+  cache_trial = TRUE
+)
 
 knitr::opts_chunk$set(fig.align = "center")
 
@@ -53,6 +56,16 @@ source(file.path(project_root, "script", "hurdle_gam.R"))
 source(file.path(project_root, "script", "model_diagnostics.R"))
 
 theme_set(theme_minimal(base_size = 12))
+
+get_metric <- function(results, component, predictor, metric) {
+  value <- results$value[
+    results$component == component &
+      results$predictor == predictor &
+      results$metric == metric
+  ]
+  if (length(value) != 1L) stop("Could not identify a unique metric value.")
+  value
+}
 ```
 
 # Objective and data
@@ -239,7 +252,8 @@ hurdle_fit
 ```{r}
 #| label: model-summary
 
-hurdle_model_summary(hurdle_fit) |>
+model_summary <- hurdle_model_summary(hurdle_fit)
+model_summary |>
   transform(
     adjusted_r_squared = round(adjusted_r_squared, 4),
     deviance_explained = round(deviance_explained, 4)
@@ -247,12 +261,31 @@ hurdle_model_summary(hurdle_fit) |>
   knitr::kable(caption = "Model-level in-sample summaries")
 ```
 
-Deviance explained is an in-sample descriptive measure, not an estimate of generalization. With rare events, even a useful occurrence model can have modest deviance explained.
+The two components behave very differently. The occurrence model explains only
+`r sprintf("%.2f%%", 100 * model_summary$deviance_explained[model_summary$component == "Event occurrence"])`
+of the binomial deviance, with adjusted $R^2$ equal to
+`r sprintf("%.4f", model_summary$adjusted_r_squared[model_summary$component == "Event occurrence"])`.
+Some behavioral modulation is present, but most frame-to-frame event variation
+is not explained by the shared covariates. In contrast, the positive-amplitude
+model explains
+`r sprintf("%.1f%%", 100 * model_summary$deviance_explained[model_summary$component == "Positive amplitude"])`
+of its in-sample deviance. This apparently strong amplitude fit must still be
+checked out of sample: it can reflect stable differences among neurons captured
+by the random intercepts rather than stable behavioral effects.
+
+Deviance explained is an in-sample descriptive measure, not an estimate of
+generalization. The very low event prevalence also makes adjusted $R^2$ less
+informative than log loss, calibration, and blocked validation.
 
 ```{r}
 #| label: concurvity
 
-occurrence_concurvity <- mgcv::concurvity(hurdle_fit$occurrence, full = TRUE)
+occurrence_concurvity <- sampled_concurvity(
+  hurdle_fit$occurrence,
+  newdata = train_data,
+  max_rows = params$concurvity_rows,
+  exclude_pattern = "neuron"
+)
 concurvity_table <- data.frame(
   term = colnames(occurrence_concurvity),
   worst = as.numeric(occurrence_concurvity["worst", ]),
@@ -265,6 +298,30 @@ knitr::kable(
   caption = "Concurvity diagnostics for the occurrence model"
 )
 ```
+
+The diagnostic uses a fixed uniform sample of
+`r format(attr(occurrence_concurvity, "sample_rows"), big.mark = ",")`
+training rows. Computing `mgcv::concurvity()` directly would construct the
+complete multi-million-row model matrix and can overflow its internal integer
+dimension calculation. The neuron random-effect term is omitted here because
+the diagnostic of interest is overlap among the behavioral smooths. Every
+neuron is observed at every frame, so neuron identity is balanced with respect
+to these frame-level covariates.
+
+The fitted result confirms a serious specification problem. The observed
+concurvity for `s(border_z)` is
+`r sprintf("%.3f", concurvity_table$observed[concurvity_table$term == "s(border_z)"])`,
+meaning that its fitted contribution is almost completely reproducible from
+the remaining terms, principally the two-dimensional position smooth. Its
+separate shape should therefore not be interpreted as an independent boundary
+effect. Speed has moderate observed concurvity
+(`r sprintf("%.3f", concurvity_table$observed[concurvity_table$term == "s(speed_z)"])`),
+while the fitted bivariate-position contribution is less redundant on the
+observed measure
+(`r sprintf("%.3f", concurvity_table$observed[concurvity_table$term == "s(x_z,y_z)"])`).
+A more defensible comparison would fit position-only and boundary-only spatial
+models and compare blocked predictive performance, rather than placing both in
+one linear predictor.
 
 # In-sample goodness of fit
 
@@ -294,6 +351,24 @@ knitr::kable(
 )
 ```
 
+In sample, the behavioral GAM raises event AUC from
+`r sprintf("%.3f", get_metric(training_metrics, "Event occurrence", "Neuron baseline", "AUC"))`
+for the neuron-only baseline to
+`r sprintf("%.3f", get_metric(training_metrics, "Event occurrence", "Hurdle GAM", "AUC"))`.
+This is real but modest ranking improvement. Log loss falls only from
+`r sprintf("%.5f", get_metric(training_metrics, "Event occurrence", "Neuron baseline", "log loss"))`
+to
+`r sprintf("%.5f", get_metric(training_metrics, "Event occurrence", "Hurdle GAM", "log loss"))`,
+and the Brier scores are indistinguishable at the displayed precision because
+non-events dominate this response. The positive-amplitude RMSE improves from
+`r sprintf("%.2f", get_metric(training_metrics, "Positive amplitude", "Neuron baseline", "RMSE"))`
+to
+`r sprintf("%.2f", get_metric(training_metrics, "Positive amplitude", "Hurdle GAM", "RMSE"))`.
+The combined thresholded-amplitude RMSE changes by less than
+`r sprintf("%.2f%%", 100 * (get_metric(training_metrics, "Thresholded amplitude", "Neuron baseline", "RMSE") - get_metric(training_metrics, "Thresholded amplitude", "Hurdle GAM", "RMSE")) / get_metric(training_metrics, "Thresholded amplitude", "Neuron baseline", "RMSE"))`.
+Thus, even before looking at the holdout, the extra behavioral terms add only a
+small amount beyond persistent neuron-to-neuron differences.
+
 ## Event calibration
 
 A calibrated event model has mean observed event frequency close to mean predicted probability. The bins below contain approximately equal numbers of neuron-frame observations. Because events are rare, both axes focus on small probabilities.
@@ -315,6 +390,10 @@ ggplot(train_calibration, aes(predicted, observed)) +
   coord_equal() +
   labs(x = "Mean predicted probability", y = "Observed event frequency", size = "Rows")
 ```
+
+The in-sample calibration points lie close to the identity line. This indicates
+reasonable average calibration over the training period, but it does not imply
+that the model captures event timing or transfers to later frames.
 
 ## Population activity over an in-sample interval
 
@@ -341,6 +420,10 @@ ggplot(train_time_long, aes(time_sec, rate, color = series)) +
   labs(x = "Trial time (seconds)", y = "Mean event rate", color = NULL)
 ```
 
+The fitted curve follows some slow changes in population activity but is much
+smoother than the observed series. It misses sharp peaks and troughs, suggesting
+unmodeled short-timescale population states, coactivation, or serial dependence.
+
 ## Spatial goodness of fit
 
 Observed and fitted event rates are averaged within spatial bins. Empty or rarely visited bins are omitted from visual emphasis by mapping their sample size to opacity.
@@ -366,6 +449,12 @@ ggplot(spatial_fit_long, aes(x, y, color = rate, alpha = n)) +
   labs(x = "Position x", y = "Position y", color = "Event rate")
 ```
 
+The fitted map reproduces the broad population-average spatial gradient but
+smooths away much of the local observed variation. More importantly, averaging
+over 462 neurons can make this plot look satisfactory even when individual
+place fields are poorly modeled: different neurons can prefer different
+locations while the current model forces them to share one spatial surface.
+
 # Out-of-sample terminal prediction
 
 No part of the terminal holdout was used to estimate event thresholds, the arena boundary, scaling constants, smooths, random effects, or baseline rates. The test therefore asks whether relationships learned earlier in the same task continue to predict the final `r params$holdout_seconds` seconds. It is a within-neuron, within-task assessment; it does not establish generalization to a new neuron, arena, trial, or mouse.
@@ -385,9 +474,43 @@ knitr::kable(
   digits = 5,
   caption = "Out-of-sample performance on the terminal holdout"
 )
+
+holdout_rate_summary <- data.frame(
+  quantity = c("Observed", "Hurdle GAM", "Neuron baseline"),
+  mean_event_rate = c(
+    mean(test_predictions$event),
+    mean(test_predictions$event_probability),
+    mean(test_predictions$baseline_event_probability)
+  )
+)
+knitr::kable(
+  holdout_rate_summary,
+  digits = 5,
+  caption = "Mean event rate in the terminal holdout"
+)
 ```
 
 For event occurrence, higher AUC is better, while lower Brier score and log loss are better. AUC measures ranking but not probability calibration; Brier score and log loss are proper scoring rules. For positive and thresholded amplitudes, lower RMSE and MAE are better. The thresholded-amplitude prediction $\widehat p_{it}\widehat\mu_{it}$ evaluates both hurdle components jointly.
+
+The out-of-sample comparison reverses the small training advantage. Event AUC
+falls to
+`r sprintf("%.3f", get_metric(test_metrics, "Event occurrence", "Hurdle GAM", "AUC"))`
+and is below the neuron-only value of
+`r sprintf("%.3f", get_metric(test_metrics, "Event occurrence", "Neuron baseline", "AUC"))`.
+The GAM also has worse log loss
+(`r sprintf("%.5f", get_metric(test_metrics, "Event occurrence", "Hurdle GAM", "log loss"))`
+versus
+`r sprintf("%.5f", get_metric(test_metrics, "Event occurrence", "Neuron baseline", "log loss"))`)
+and worse Brier score. Conditional positive-amplitude RMSE is
+`r sprintf("%.2f", get_metric(test_metrics, "Positive amplitude", "Hurdle GAM", "RMSE"))`
+for the GAM versus
+`r sprintf("%.2f", get_metric(test_metrics, "Positive amplitude", "Neuron baseline", "RMSE"))`
+for the baseline. For the joint thresholded response, MAE is
+`r sprintf("%.3f", get_metric(test_metrics, "Thresholded amplitude", "Hurdle GAM", "MAE"))`
+versus
+`r sprintf("%.3f", get_metric(test_metrics, "Thresholded amplitude", "Neuron baseline", "MAE"))`.
+The behavioral model therefore loses to the simpler baseline on every reported
+terminal-holdout metric.
 
 ```{r}
 #| label: test-calibration
@@ -407,6 +530,15 @@ ggplot(test_calibration, aes(predicted, observed)) +
   labs(x = "Mean predicted probability", y = "Observed event frequency", size = "Rows")
 ```
 
+The holdout calibration curve lies mostly below the identity line, especially
+for the highest predicted probabilities. On average, the GAM predicts an event
+rate of
+`r sprintf("%.4f", mean(test_predictions$event_probability))`, compared with
+the observed rate of `r sprintf("%.4f", mean(test_predictions$event))`.
+This systematic overprediction is consistent with the lower event prevalence
+in the holdout (`r sprintf("%.4f", mean(test_data$event))`) than in training
+(`r sprintf("%.4f", mean(train_data$event))`).
+
 ```{r}
 #| label: test-time-prediction
 #| fig-cap: "Observed and out-of-sample predicted population event rates in the terminal holdout."
@@ -425,16 +557,168 @@ ggplot(test_time_long, aes(time_sec, rate, color = series)) +
   labs(x = "Trial time (seconds)", y = "Mean event rate", color = NULL)
 ```
 
-# Interpretation and limitations
+The time plot shows that overprediction persists across nearly the entire
+holdout and becomes particularly large around 720--723 seconds. The smooth of
+absolute time is evaluated just beyond its training range here; GAM smooths are
+not reliable extrapolators, and its terminal trend appears to contribute to the
+failure.
 
-The most important comparison is between the hurdle GAM and the neuron-only baseline on the terminal holdout. Improvement there indicates that position, boundary distance, speed, and gradual time variation add predictive information beyond stable differences in each neuron's event rate and amplitude.
+# Overall assessment
 
-Several limitations remain:
+Generally speaking, this version of the model is **not yet a good predictive
+model**. It is well calibrated in sample and the positive-amplitude component
+has substantial in-sample deviance explained, but these facts do not survive
+the more important terminal-block comparison. The neuron-only baseline is
+better on all holdout metrics. The event AUC of approximately
+`r sprintf("%.2f", get_metric(test_metrics, "Event occurrence", "Hurdle GAM", "AUC"))`
+is only modestly above random ranking, and the GAM systematically overpredicts
+the lower activity level at the end of the trial.
 
-1. `S` and its positive amplitudes are deconvolution estimates, so coefficient shapes describe the preprocessing output and should not be interpreted as exact firing-rate or burst-size effects.
-2. The common spatial smooth estimates population-average modulation. It does not capture a separate place field for every neuron. Neuron-specific spatial smooths are a possible extension but are much larger and require careful regularization.
-3. The model does not explicitly represent residual coactivation among neurons. Its uncertainty estimates can therefore be too narrow even when blocked predictive performance is reasonable.
-4. Position and border distance are mathematically related. Strong concurvity weakens attempts to attribute a pattern uniquely to one of these two terms.
-5. This terminal split tests persistence over time within one recording. Generalization across repeated tasks, days, and mice requires a separate hierarchical validation design.
+The results nevertheless identify several useful signals and failure modes:
 
-The next useful extension is a discrete-time, Hawkes-inspired predictor based on lagged, distance-weighted activity of other neurons. It should be evaluated by whether it improves the same terminal-block scores after all behavioral covariates in this model are included.
+1. Stable differences among neurons matter. The neuron-only baseline is strong,
+   and neuron random intercepts account for an important part of the apparent
+   amplitude fit.
+2. A shared behavioral response adds a small amount in sample but is not stable
+   at the end of the recording.
+3. One population-wide position surface is biologically too restrictive for
+   CA1 place cells, which can have distinct place fields.
+4. The separate position and boundary effects are not identifiable in the
+   current specification because boundary distance is almost completely
+   concurvitable with two-dimensional position.
+5. The smooth temporal trend misses rapid population fluctuations and
+   extrapolates poorly into a terminal holdout.
+
+These conclusions concern prediction within this trial. They do not imply that
+mouse position or anatomical organization is biologically unimportant; rather,
+the current pooled parameterization does not represent their neuron-specific
+effects adequately.
+
+# How to improve the model
+
+## Simplify and validate the population-level terms
+
+The first step should be an ablation analysis using several rolling-origin time
+splits, not just the final 30 seconds. Compare the neuron baseline against
+nested models containing speed, position, boundary distance, and time. In
+particular:
+
+- compare `s(x_z, y_z)` against `s(border_z)` instead of including both;
+- remove `s(time_z)` initially, or represent time using coarse training blocks
+  that do not require smooth extrapolation;
+- report precision--recall performance in addition to ROC AUC because events
+  occur in only about 0.5% of neuron-frame rows;
+- evaluate several event thresholds and a lognormal or Gamma model for the
+  excess amplitude $S_{it}-c_i$, since the observed positive distribution is
+  threshold-truncated;
+- use a block bootstrap or block-level validation for uncertainty because
+  adjacent frames are dependent.
+
+The preferred specification should be chosen from mean log loss across several
+held-out time blocks. The final block can then remain untouched for a last
+model comparison.
+
+## Allow behavioral tuning to differ among neurons
+
+The current random intercept allows different baseline rates but forces every
+neuron to share the same position, boundary, speed, and time effects. This is
+probably the central modeling limitation. A full two-dimensional smooth for
+each of 462 neurons is too large for a first laptop model, but useful
+intermediate choices include:
+
+1. cluster neurons using training data only and fit group-specific position
+   smooths, for example `s(x_z, y_z, by = neuron_group)`;
+2. fit neuron-specific spatial models only for neurons with enough events and
+   use a simpler partial-pooling model for sparse neurons;
+3. use a reduced-rank hierarchical model in which neuron-specific spatial
+   surfaces are combinations of a small number of shared spatial basis
+   functions.
+
+Any response-based clustering must be performed independently within each
+training fold. Clustering once on the complete trial would leak holdout activity
+into model construction.
+
+## Use hippocampal neuron centroids
+
+Let ${\bf c}_i=(c_{xi},c_{yi})$ denote neuron $i$'s centroid in the miniscope
+field of view. The centroids describe anatomical neuron location, whereas
+$(x_t,y_t)$ describes the mouse's position in the arena; these are distinct
+coordinate systems and should never be combined as if they were one spatial
+map.
+
+The simplest anatomical model decomposes the neuron baseline into a smooth
+centroid effect and residual neuron heterogeneity:
+
+$$
+b_i=h(c_{xi},c_{yi})+\epsilon_i.
+$$
+
+An exploratory `mgcv` implementation is
+
+```r
+event ~
+  s(centroid_x_z, centroid_y_z, bs = "gp", k = 50) +
+  s(neuron, bs = "re") +
+  s(x_z, y_z, k = 40) +
+  s(speed_z, k = 8)
+```
+
+The Gaussian-process centroid smooth asks whether nearby neurons have similar
+baseline event propensities, while the neuron random effect retains residual
+cell-specific variation. Because centroid coordinates are constant within a
+neuron, these two terms can themselves be concurvitable; their penalties and
+blocked predictive comparison must be examined. A more explicit hierarchical
+version would give the vector of neuron effects a covariance that decays with
+centroid distance:
+
+$$
+\operatorname{Cov}(b_i,b_j)=
+\sigma_c^2\exp\{-\lVert {\bf c}_i-{\bf c}_j\rVert/\rho\}
++\sigma_i^2\mathbb 1(i=j).
+$$
+
+For prediction of these same 462 neurons, a centroid main effect may not beat
+individual random intercepts: the random intercept already learns one baseline
+per cell. Centroids become more valuable for structured shrinkage, prediction
+for sparsely active or new neurons, and modeling how neuronal activity is
+coordinated.
+
+A practical next model is therefore to form anatomical groups using centroid
+coordinates alone and allow group-specific mouse-position smooths:
+
+$$
+\operatorname{logit}(p_{it})=
+\beta_0+b_i+f_{G_i}(x_t,y_t)+f_v(v_t),
+$$
+
+where $G_i$ is an anatomical group. Since the groups use centroids rather than
+the held-out responses, this avoids response leakage. It directly tests whether
+anatomically nearby neurons share behavioral tuning.
+
+Finally, centroid distances can support a constrained Hawkes-inspired feature:
+
+$$
+A_{it}^{(\ell)}=
+\sum_{j\ne i}\exp(-d_{ij}/\rho)Y_{j,t-\ell},
+$$
+
+with a few prespecified lags $\ell$. Adding these distance-weighted recent
+population-activity summaries to the occurrence GAM would test whether nearby
+neuronal activity improves prediction beyond mouse position, speed, and neuron
+baseline. It is much smaller than estimating all $462^2$ directed interactions
+and should still be interpreted as predictive coactivation, not synaptic
+causality.
+
+## Recommended sequence
+
+The next analysis should proceed in this order:
+
+1. establish a rolling-block baseline and remove the unstable absolute-time
+   smooth;
+2. choose either mouse position or boundary distance by blocked log loss;
+3. add centroid-structured neuron baselines;
+4. add centroid-defined group-specific place fields;
+5. only then test distance-weighted lagged population activity.
+
+Each step should be retained only if it improves prediction across multiple
+held-out blocks rather than merely increasing in-sample deviance explained.
