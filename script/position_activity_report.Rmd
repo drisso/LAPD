@@ -1,0 +1,132 @@
+---
+title: "Position-related neuronal activity and arena boundaries"
+author: "LAPD"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: false
+    number_sections: false
+    theme: flatly
+    code_folding: hide
+    fig_caption: true
+    df_print: paged
+  pdf_document:
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+library(ggplot2)
+```
+
+We summarize the relationship between mouse position, arena geometry, and simultaneous neuronal activity.
+
+Neuronal activity is obtained by thresholding the inferred activity matrix $S$ separately for each neuron. A neuron is considered active when its value exceeds its neuron-specific 90th percentile within the corresponding trial.
+
+```{r run-analysis, include=FALSE}
+analysis_script <- "analysis_eda.R"
+
+if (!file.exists(analysis_script)) {
+  stop(
+    paste0(
+      "The analysis script '", analysis_script, "' was not found. ",
+      "Save the cleaned analysis code in the same folder as this R Markdown file ",
+      "using this filename."
+    )
+  )
+}
+
+source(analysis_script, local = knitr::knit_global())
+
+required_objects <- c(
+  "p_boundary_distance_map",
+  "p_boundary_activity_all_mice",
+  "p_position_activity_all_mice"
+)
+
+missing_objects <- required_objects[
+  !vapply(
+    required_objects,
+    exists,
+    logical(1),
+    envir = knitr::knit_global()
+  )
+]
+
+if (length(missing_objects) > 0) {
+  stop(
+    paste(
+      "The following plot objects were not created by the analysis script:",
+      paste(missing_objects, collapse = ", ")
+    )
+  )
+}
+```
+
+# Distance from the arena boundary
+
+For each recorded mouse position, the distance to the nearest arena boundary is computed according to the arena geometry:
+
+-   for the circular arena, the distance is measured radially from the estimated circumference;
+-   for the square arena, it is the minimum distance to the four sides;
+-   for the triangular arena, it is the minimum Euclidean distance to the three finite edges.
+
+The distance is normalized separately within each shape and day. Values close to zero correspond to positions near the boundary, whereas larger values correspond to more central positions.
+
+```{r boundary-distance-map, fig.width=10, fig.height=11, fig.cap="Relative distance of the selected mouse from the nearest arena boundary."}
+p_boundary_distance_map
+```
+
+# Neuronal activity and boundary distance across mice
+
+The following figure relates the mean proportion of active neurons to relative distance from the nearest arena boundary.
+
+Grey curves represent individual mice. The blue curve is the mean across mice within each distance interval, and the shaded region represents one standard error around the mean. A relative distance of zero indicates the arena boundary, while a value of one indicates the most central observed positions.
+
+```{r boundary-activity-all-mice, fig.width=11, fig.height=10, fig.cap="Mean neuronal activity as a function of relative boundary distance across all mice."}
+p_boundary_activity_all_mice
+```
+
+# Position-related neuronal activity for all mice
+
+Each row corresponds to one mouse, and the columns distinguish arena shape and experimental day. The mice are shown separately and are not pooled within panels.
+
+Point colour represents the proportion of simultaneously active neurons. Point size also increases with the number of active neurons to make high-activity events more visible.
+
+```{r position-activity-all-mice, fig.width=18, fig.height=12, fig.cap="Position-related neuronal activity shown separately for every mouse, arena shape, and day."}
+p_position_activity_all_mice
+```
+```{r}
+p_S_timeseries_example
+```
+
+
+```{r save-plots, include=FALSE}
+ggsave(
+  "boundary_distance_map.pdf",
+  p_boundary_distance_map,
+  width = 10,
+  height = 11
+)
+
+ggsave(
+  "boundary_activity_all_mice.pdf",
+  p_boundary_activity_all_mice,
+  width = 11,
+  height = 10
+)
+
+ggsave(
+  "position_activity_all_mice.pdf",
+  p_position_activity_all_mice,
+  width = 14,
+  height = 10
+)
+```
