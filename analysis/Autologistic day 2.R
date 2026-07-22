@@ -11,6 +11,8 @@ library(ggplot2)
 library(tidyr)
 library(pROC)
 
+experiment <- all_trials$M3412$trial1
+
 # ==============================================================================
 # FASE 1: Preparazione e Allineamento Dati (Baseline Spaziale + Lags)
 # ==============================================================================
@@ -42,7 +44,7 @@ prepare_design_matrix <- function(trial_data, max_lag_frames = 3, n_splines = 4)
   bx <- bs(pos_x, df = n_splines)
   by <- bs(pos_y, df = n_splines)
   
-  # Prodotto tensoriale per generare la griglia di basi spaziali 2D
+  # Tensor product
   X_spatial_list <- lapply(1:ncol(bx), function(i) bx[, i] * by)
   X_spatial <- do.call(cbind, X_spatial_list)      # [T_frames x (n_splines^2)]
   colnames(X_spatial) <- paste0("spatial_basis_", 1:ncol(X_spatial))
@@ -56,7 +58,7 @@ prepare_design_matrix <- function(trial_data, max_lag_frames = 3, n_splines = 4)
   }
   X_lags <- do.call(rbind, X_lags) %>% t()        # [T_frames x (K * max_lag_frames)]
   
-  # Design Matrix Finale: [X_spaziale | X_lags]
+  # Final Design Matrix: [X_spatial | X_lags]
   X_full <- cbind(X_spatial, X_lags)
   
   return(list(
@@ -136,7 +138,7 @@ fit_model <- function(prep_data, family = "binomial", min_spikes = 15, nfolds = 
         penalty.factor = penalty_sub,
         foldid = foldid,
         lambda = lambda_grid,                     
-        type.measure = "mse",
+        type.measure = "deviance",
         alpha = 1,
         maxit = 100000, parallel = TRUE
       )
@@ -189,12 +191,13 @@ fit_model <- function(prep_data, family = "binomial", min_spikes = 15, nfolds = 
 }
 
 # 1. Preparazione Dati per Trial 1 (Train)
-prep_t1 <- prepare_design_matrix(all_trials$M3424F$trial1, max_lag_frames = 3)
+prep_t1 <- prepare_design_matrix(experiment, max_lag_frames = 3)
 
 # 2. Fit del Modello
 fit_t1 <- fit_model(prep_t1, family = "binomial", min_spikes = 15, nfolds = 5)
 
-
+#fit_M3424F mouse M3424F trial 2
+#fit_M3412 mous M3412 trail 1
 # ==============================================================================
 # FASE 3: Funzione di Previsione (Forecasting su Nuovi Trial / Test Set)
 # ==============================================================================
@@ -209,7 +212,7 @@ predict_model <- function(fit_results, test_trial_data) {
     max_lag_frames = max_lag
   )
   
-  # 2. FILTRA LA MATRICE DI TEST SULLE STESSE COLONNE DEL TRAIN (1117 colonne)
+  # 2. FILTRA LA MATRICE DI TEST SULLE STESSE COLONNE DEL TRAIN 
   X_test_sub <- prep_test$X[, valid_cols, drop = FALSE]
   dimnames(X_test_sub) <- list(NULL, paste0("V", 1:ncol(X_test_sub)))
   X_test_sparse <- Matrix(X_test_sub, sparse = TRUE)
@@ -241,8 +244,8 @@ predict_model <- function(fit_results, test_trial_data) {
   ))
 }
 
-# 3. Previsione sul Trial 2 (Test)
-predictions_t2 <- predict_model(fit_t1, test_trial_data = all_trials$M3412$trial1)
+# 3. Previsione in sample
+predictions_t2 <- predict_model(fit_t1, test_trial_data = experiment)
 
 # 1. Preparazione parametri
 active_ids <- fit_t1$active_neurons
@@ -263,7 +266,7 @@ for (k in seq_along(active_ids)) {
     roc_i <- roc(y_true, y_pred, quiet = TRUE)
     auc_vector <- c(auc_vector, auc(roc_i))
     
-    # Inizializza il grafico con la prima curva, poi aggiungi le successive (add = TRUE)
+    # Inizializza il grafico con la prima curva, poi aggiungi le successive 
     if (first_valid) {
       plot(roc_i, col = rgb(0.5, 0.5, 0.5, 0.15), 
            main = sprintf("ROC curve (Active Neurons %d)", length(active_ids)),
@@ -291,8 +294,67 @@ mean_sens <- colMeans(sens_matrix, na.rm = TRUE)
 lines(x = grid_spec, y = mean_sens, col = "red", lwd = 3.5)
 
 mean_auc <- mean(auc_vector, na.rm = TRUE)
+mean_auc
 
 
+evaluate_predictions <- function(predictions, active_neurons) {
+  
+  auc_list <- numeric(length(active_neurons))
+  roc_data_list <- list()
+  grid_spec <- seq(0, 1, length.out = 200)
+  sens_matrix <- matrix(NA, nrow = length(active_neurons), ncol = length(grid_spec))
+  
+  for (k in seq_along(active_neurons)) {
+    i <- active_neurons[k]
+    y_true <- predictions$actual_spikes[i, ]
+    y_pred <- predictions$predicted_probs[i, ]
+    
+    if (length(unique(y_true)) > 1) {
+      roc_i <- roc(y_true, y_pred, quiet = TRUE)
+      auc_list[k] <- auc(roc_i)
+      
+      ord <- order(roc_i$specificities)
+      sens_interp <- approx(
+        x = roc_i$specificities[ord], 
+        y = roc_i$sensitivities[ord], 
+        xout = grid_spec, 
+        rule = 2
+      )$y
+      sens_matrix[k, ] <- sens_interp
+      
+      roc_data_list[[k]] <- data.frame(
+        Specificity = roc_i$specificities,
+        Sensitivity = roc_i$sensitivities,
+        Neuron = factor(i)
+      )
+    }
+  }
+  
+  df_roc_all <- bind_rows(roc_data_list)
+  df_roc_mean <- data.frame(
+    Specificity = grid_spec,
+    Sensitivity = colMeans(sens_matrix, na.rm = TRUE)
+  )
+  
+  p_roc <- ggplot() +
+    geom_line(data = df_roc_all, aes(x = 1 - Specificity, y = Sensitivity, group = Neuron), 
+              color = "gray70", alpha = 0.25) +
+    geom_line(data = df_roc_mean, aes(x = 1 - Specificity, y = Sensitivity), 
+              color = "darkred", linewidth = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+    labs(
+      title = sprintf("ROC Curves (Mean AUC = %.3f)", mean(auc_list, na.rm = TRUE)),
+      x = "1 - Specificity (False Positive Rate)",
+      y = "Sensitivity (True Positive Rate)"
+    ) +
+    theme_minimal()
+  
+  return(list(
+    auc_vector = auc_list,
+    mean_auc = mean(auc_list, na.rm = TRUE),
+    p_roc = p_roc
+  ))
+}
 
 #############################################################
 plot_neuron_place_field <- function(fit_results, trial_data, neuron_id, grid_size = 100) {
@@ -375,11 +437,11 @@ plot_neuron_place_field <- function(fit_results, trial_data, neuron_id, grid_siz
   )
 }
 
-neuron_da_mostrare <- fit_t1$active_neurons[18]
+neuron_da_mostrare <- fit_t1$active_neurons[278]
 
 plot_neuron_place_field(
   fit_results = fit_t1, 
-  trial_data = all_trials$M3412$trial1, 
+  trial_data = experiment, 
   neuron_id = neuron_da_mostrare,
   grid_size = 120
 )
@@ -445,7 +507,7 @@ plot_single_lag <- function(fit_results, lag = 1, only_active = TRUE) {
     geom_tile() +
     scale_fill_gradientn(
       colors = c("#F8F9F9", "#CBD5E1", "#F5B041", "#E74C3C", "#78281F"),
-      name = "Coeff gamma"
+      name = "Coeff. gamma"
     ) +
     labs(
       x = "Target neuron",
@@ -460,7 +522,7 @@ plot_single_lag <- function(fit_results, lag = 1, only_active = TRUE) {
     )
   
   return(p)
-}
+} 
 
 # Heatmap solo per il Lag 1 
 p_lag1 <- plot_single_lag(fit_t1, lag = 1, only_active = T)
@@ -476,144 +538,140 @@ print(p_lag3)
 
 
 
-plot_spatial_from_lag_heatmap <- function(fit_results, lag = 1, target_id = NULL, min_weight = 0) {
-  
-  K <- fit_results$prep_data$K
-  max_lag <- fit_results$prep_data$max_lag_frames
-  n_spatial <- fit_results$prep_data$n_spatial_cols
-  active_neurons <- fit_results$active_neurons
-  valid_cols <- fit_results$valid_cols
-  dt_ms <- fit_results$prep_data$dt_ms
-  centroids <- fit_results$prep_data$centroids
-  
-  if (lag < 1 || lag > max_lag) {
-    stop(sprintf("Lag non valido! Scegli un valore compreso tra 1 e %d.", max_lag))
-  }
-  
-  # --- 1. Estrazione Matrice W esatta per il solo LAG selezionato ---
-  W_mat_lag <- matrix(0, nrow = K, ncol = K)
-  
-  for (i in active_neurons) {
-    fit_i <- fit_results$models[[i]]
-    if (!is.null(fit_i)) {
-      if (inherits(fit_i, "cv.glmnet")) {
-        coefs_sub <- as.matrix(coef(fit_i, s = "lambda.1se"))[-1, 1]
-      } else {
-        mid_idx <- round(length(fit_i$lambda) / 2)
-        coefs_sub <- as.matrix(coef(fit_i))[-1, mid_idx]
-      }
-      
-      full_coefs <- numeric(ncol(fit_results$prep_data$X))
-      full_coefs[valid_cols] <- coefs_sub
-      
-      coef_lags <- full_coefs[(n_spatial + 1):length(full_coefs)]
-      coef_mat <- matrix(coef_lags, nrow = K, ncol = max_lag)
-      
-      W_mat_lag[, i] <- coef_mat[, lag]
-    }
-  }
-  diag(W_mat_lag) <- 0  # Rimuoviamo le autoconnessioni
-  
-  # --- 2. Costruzione della lista dei collegamenti non nulli per questo Lag ---
-  edges_list <- list()
-  for (j in 1:K) {
-    for (i in 1:K) {
-      w <- W_mat_lag[j, i]
-      if (w > min_weight) {
-        edges_list[[length(edges_list) + 1]] <- data.frame(
-          Source = j, Target = i,
-          x_src = centroids[j, 1], y_src = centroids[j, 2],
-          x_tgt = centroids[i, 1], y_tgt = centroids[i, 2],
-          Weight = w
-        )
-      }
-    }
-  }
-  
-  df_edges <- if (length(edges_list) > 0) bind_rows(edges_list) else data.frame()
-  
-  # Filtro opzionale se si vuole isolare un singolo neurone target
-  if (!is.null(target_id) && nrow(df_edges) > 0) {
-    df_edges <- df_edges %>% filter(Source == target_id | Target == target_id)
-  }
-  
-  df_nodes <- data.frame(
-    Neuron = 1:K,
-    X = centroids[, 1],
-    Y = centroids[, 2]
-  )
-  
-  lag_ms <- round(lag * dt_ms)
-  
-  # --- 3. Rendering Grafico Spaziale ---
-  p <- ggplot() +
-    # Sfondo: Centroidi di tutti i neuroni
-    geom_point(data = df_nodes, aes(x = X, y = Y), 
-               color = "#E0E0E0", size = 1.2, alpha = 0.6) +
-    
-    # Frecce orientate per i collegamenti definiti nella heatmap
-    {
-      if (nrow(df_edges) > 0) {
-        geom_segment(
-          data = df_edges,
-          aes(x = x_src, y = y_src, xend = x_tgt, yend = y_tgt, 
-              color = Weight, alpha = Weight),
-          arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
-          linewidth = 0.6
-        )
-      }
-    } +
-    
-    # Evidenziazione dei neuroni coinvolti nei collegamenti
-    {
-      if (nrow(df_edges) > 0) {
-        connected_ids <- unique(c(df_edges$Source, df_edges$Target))
-        df_connected <- df_nodes %>% filter(Neuron %in% connected_ids)
-        
-        geom_point(data = df_connected, aes(x = X, y = Y), 
-                   color = "#2C3E50", size = 1.8)
-      }
-    } +
-    
-    # Evidenziazione del neurone target se specificato
-    {
-      if (!is.null(target_id)) {
-        df_target <- df_nodes %>% filter(Neuron == target_id)
-        geom_point(data = df_target, aes(x = X, y = Y), 
-                   color = "black", fill = "#00FF66", shape = 21, size = 3, stroke = 1.2)
-      }
-    } +
-    
-    scale_color_gradientn(
-      colors = c("#F5B041", "#E74C3C", "#78281F"),
-      name = "Coeff. gamma"
-    ) +
-    scale_alpha_continuous(range = c(0.45, 0.95), guide = "none") +
-    coord_fixed() +
-    theme_minimal() +
-    theme(
-      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "gray30"),
-      panel.grid = element_line(color = "gray95")
-    )
-  
-  return(p)
-}
+# plot_spatial_from_lag_heatmap <- function(fit_results, lag = 1, target_id = NULL, min_weight = 0) {
+#   
+#   K <- fit_results$prep_data$K
+#   max_lag <- fit_results$prep_data$max_lag_frames
+#   n_spatial <- fit_results$prep_data$n_spatial_cols
+#   active_neurons <- fit_results$active_neurons
+#   valid_cols <- fit_results$valid_cols
+#   dt_ms <- fit_results$prep_data$dt_ms
+#   centroids <- fit_results$prep_data$centroids
+#   
+#   if (lag < 1 || lag > max_lag) {
+#     stop(sprintf("Lag non valido! Scegli un valore compreso tra 1 e %d.", max_lag))
+#   }
+#   
+#   # --- 1. Estrazione Matrice W esatta per il solo LAG selezionato ---
+#   W_mat_lag <- matrix(0, nrow = K, ncol = K)
+#   
+#   for (i in active_neurons) {
+#     fit_i <- fit_results$models[[i]]
+#     if (!is.null(fit_i)) {
+#       if (inherits(fit_i, "cv.glmnet")) {
+#         coefs_sub <- as.matrix(coef(fit_i, s = "lambda.1se"))[-1, 1]
+#       } else {
+#         mid_idx <- round(length(fit_i$lambda) / 2)
+#         coefs_sub <- as.matrix(coef(fit_i))[-1, mid_idx]
+#       }
+#       
+#       full_coefs <- numeric(ncol(fit_results$prep_data$X))
+#       full_coefs[valid_cols] <- coefs_sub
+#       
+#       coef_lags <- full_coefs[(n_spatial + 1):length(full_coefs)]
+#       coef_mat <- matrix(coef_lags, nrow = K, ncol = max_lag)
+#       
+#       W_mat_lag[, i] <- coef_mat[, lag]
+#     }
+#   }
+#   diag(W_mat_lag) <- 0  # Rimuoviamo le autoconnessioni
+#   
+#   # --- 2. Costruzione della lista dei collegamenti non nulli per questo Lag ---
+#   edges_list <- list()
+#   for (j in 1:K) {
+#     for (i in 1:K) {
+#       w <- W_mat_lag[j, i]
+#       if (w != 0) {
+#         edges_list[[length(edges_list) + 1]] <- data.frame(
+#           Source = j, Target = i,
+#           x_src = centroids[j, 1], y_src = centroids[j, 2],
+#           x_tgt = centroids[i, 1], y_tgt = centroids[i, 2],
+#           Weight = w
+#         )
+#       }
+#     }
+#   }
+#   
+#   df_edges <- if (length(edges_list) > 0) bind_rows(edges_list) else data.frame()
+#   
+#   # Filtro opzionale se si vuole isolare un singolo neurone target
+#   if (!is.null(target_id) && nrow(df_edges) > 0) {
+#     df_edges <- df_edges %>% filter(Source == target_id | Target == target_id)
+#   }
+#   
+#   df_nodes <- data.frame(
+#     Neuron = 1:K,
+#     X = centroids[, 1],
+#     Y = centroids[, 2]
+#   )
+#   
+#   lag_ms <- round(lag * dt_ms)
+#   
+#   # --- 3. Rendering Grafico Spaziale ---
+#   p <- ggplot() +
+#     # Sfondo: Centroidi di tutti i neuroni
+#     geom_point(data = df_nodes, aes(x = X, y = Y), 
+#                color = "#E0E0E0", size = 1.2, alpha = 0.6) +
+#     
+#     # Frecce orientate per i collegamenti definiti nella heatmap
+#     {
+#       if (nrow(df_edges) > 0) {
+#         geom_segment(
+#           data = df_edges,
+#           aes(x = x_src, y = y_src, xend = x_tgt, yend = y_tgt, 
+#               color = Weight, alpha = Weight),
+#           arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+#           linewidth = 0.6
+#         )
+#       }
+#     } +
+#     
+#     # Evidenziazione dei neuroni coinvolti nei collegamenti
+#     {
+#       if (nrow(df_edges) > 0) {
+#         connected_ids <- unique(c(df_edges$Source, df_edges$Target))
+#         df_connected <- df_nodes %>% filter(Neuron %in% connected_ids)
+#         
+#         geom_point(data = df_connected, aes(x = X, y = Y), 
+#                    color = "#2C3E50", size = 1.8)
+#       }
+#     } +
+#     
+#     # Evidenziazione del neurone target se specificato
+#     {
+#       if (!is.null(target_id)) {
+#         df_target <- df_nodes %>% filter(Neuron == target_id)
+#         geom_point(data = df_target, aes(x = X, y = Y), 
+#                    color = "black", fill = "#00FF66", shape = 21, size = 3, stroke = 1.2)
+#       }
+#     } +
+#     
+#     scale_color_gradientn(
+#       colors = c("#F5B041", "#E74C3C", "#78281F"),
+#       name = "Coeff. gamma"
+#     ) +
+#     scale_alpha_continuous(range = c(0.45, 0.95), guide = "none") +
+#     coord_fixed() +
+#     theme_minimal() +
+#     theme(
+#       plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+#       plot.subtitle = element_text(size = 10, hjust = 0.5, color = "gray30"),
+#       panel.grid = element_line(color = "gray95")
+#     )
+#   
+#   return(p)
+# }
+# 
+# p_net_lag1 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 1)
+# print(p_net_lag1)
+# 
+# p_net_lag2 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 2)
+# print(p_net_lag2)
+# 
+# p_net_lag3 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 3)
+# print(p_net_lag3)
 
-p_net_lag1 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 1)
-print(p_net_lag1)
-
-p_net_lag2 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 2)
-print(p_net_lag2)
-
-p_net_lag3 <- plot_spatial_from_lag_heatmap(fit_t1, lag = 3)
-print(p_net_lag3)
-
-
-library(ggplot2)
-library(dplyr)
-
-plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = NULL, min_weight = 0) {
+plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = NULL) {
   
   K <- fit_results$prep_data$K
   max_lag <- fit_results$prep_data$max_lag_frames
@@ -661,7 +719,7 @@ plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = N
     
     # 1A. Estrazione Autoconnessioni (gamma_ii sulla diagonale)
     gamma_ii <- diag(W_mat_lag)
-    self_ids <- which(gamma_ii > min_weight)
+    self_ids <- which(gamma_ii != 0)
     
     if (length(self_ids) > 0) {
       all_self_list[[length(all_self_list) + 1]] <- data.frame(
@@ -679,7 +737,7 @@ plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = N
     for (j in 1:K) {
       for (i in 1:K) {
         w <- W_mat_lag[j, i]
-        if (w > min_weight) {
+        if (w != 0) {
           all_edges_list[[length(all_edges_list) + 1]] <- data.frame(
             Source = j, Target = i,
             x_src = centroids[j, 1], y_src = centroids[j, 2],
@@ -732,7 +790,7 @@ plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = N
   
   # --- 2. Rendering Grafico ggplot2 ---
   p <- ggplot() +
-    # Layer 1: Sfondo nodi dell'ippocampo (grigio chiaro)
+    # Layer 1: Nodi dell'ippocampo 
     geom_point(data = df_nodes, aes(x = X, y = Y), 
                color = "#E0E0E0", size = 1.2, alpha = 0.6) +
     
@@ -749,37 +807,33 @@ plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = N
       }
     } +
     
-    # Layer 3: Nodi coinvolti in connessioni inter-neurone (blu scuro)
+    # Layer 3: Nodi coinvolti in connessioni inter-neurone 
     {
       if (nrow(df_connected) > 0) {
         geom_point(data = df_connected, aes(x = X, y = Y), 
-                   color = "#2C3E50", size = 1.6, alpha = 0.9)
+                   color = "#2C3E50", size = 1.8, alpha = 0.9)
       }
     } +
     
-    # Layer 4: NEURONI CON AUTO-CONNESSIONE (gamma_ii > 0) IN ROSSO
+    # Layer 4: NEURONI CON AUTO-CONNESSIONE (gamma_ii != 0) 
     {
       if (nrow(df_self) > 0) {
         geom_point(data = df_self, aes(x = X, y = Y), 
-                   color = "#78281F", size = 1.6, alpha = 0.9)
-      }
-    } +
-    
-    # Layer 5: Neurone target evidenziato (se specificato)
-    {
-      if (!is.null(target_id)) {
-        df_target <- df_nodes %>% filter(Neuron == target_id)
-        geom_point(data = df_target, aes(x = X, y = Y), 
-                   color = "black", fill = "#00FF66", shape = 21, size = 3.5, stroke = 1.2)
+                   color = "#39B5FF", size = 1.8, alpha = 0.9)
       }
     } +
     
     facet_wrap(~ Lag, nrow = 1) +
     
-    scale_color_gradientn(
-      colors = c("#F5B041", "#E74C3C", "#78281F"),
-      name = "Coeff. gamma_ij"
+    # GRADIENTE DIVERGENTE CON ZERO = BIANCO PERFETTO
+    scale_color_gradient2(
+      low = "blue",
+      mid = "white",
+      high = "darkred",
+      midpoint = 0,
+      name = "Coeff. gamma"
     ) +
+    
     scale_alpha_continuous(range = c(0.45, 0.95), guide = "none") +
     coord_fixed() +
     theme_minimal() +
@@ -798,5 +852,6 @@ plot_spatial_multi_lag <- function(fit_results, lags = c(1, 2, 3), target_id = N
 # Disegna i 3 lag affiancati in una sola figura
 p_multi <- plot_spatial_multi_lag(fit_t1, lags = c(1, 2, 3))
 print(p_multi)
+
 
 
