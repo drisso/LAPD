@@ -2,7 +2,7 @@ plot_speed_spike_timeseries <- function(predictions,
                                         data_w_dist, 
                                         neuron_id = 1, 
                                         frame_range = c(1, 1000), 
-                                        threshold = 0.3) {
+                                        threshold = 0.15) { # Default aggiornato a 0.15
   
   Z_obs  <- predictions$actual_spikes    # [K x T]
   Z_pred <- predictions$predicted_probs # [K x T]
@@ -11,7 +11,7 @@ plot_speed_spike_timeseries <- function(predictions,
   K <- nrow(Z_obs)
   T_total <- ncol(Z_obs)
   
-  # 1. Gestione finestra temporale (frames)
+  # 1. Finestra temporale
   if (is.null(frame_range)) {
     frame_range <- c(1, T_total)
   }
@@ -19,10 +19,9 @@ plot_speed_spike_timeseries <- function(predictions,
   end_frame   <- min(T_total, frame_range[2])
   frames_idx  <- start_frame:end_frame
   
-  # Vettore del tempo in secondi
   time_sec <- (frames_idx * dt_ms) / 1000
   
-  # 2. Interpolazione della velocità sui frame temporali considerati
+  # 2. Interpolazione velocità sui frame considerati
   speed_interp <- approx(
     x = data_w_dist$time, 
     y = data_w_dist$speed_spline, 
@@ -35,73 +34,74 @@ plot_speed_spike_timeseries <- function(predictions,
     Speed = speed_interp
   )
   
-  # 3. Estrazione degli spike per il neurone selezionato
+  # 3. Estrazione Spike Osservati e Binarizzazione Predizioni a Soglia = 0.15
   obs_spikes  <- Z_obs[neuron_id, frames_idx]
   pred_probs  <- Z_pred[neuron_id, frames_idx]
   pred_spikes <- ifelse(pred_probs >= threshold, 1, 0)
   
-  # Tempi esatti di occorrenza degli spike
-  df_obs_spikes  <- data.frame(Time = time_sec[obs_spikes == 1])
-  df_pred_spikes <- data.frame(Time = time_sec[pred_spikes == 1])
-  
-  # 4. Calcolo delle altezze verticali per le barre degli spike (sopra la curva di velocità)
+  # 4. Calcolo posizioni verticali sopra la curva di velocità
   max_speed <- max(df_speed$Speed, na.rm = TRUE)
   min_speed <- min(df_speed$Speed, na.rm = TRUE)
   speed_range <- ifelse(max_speed == min_speed, 1, max_speed - min_speed)
   
-  # Livelli Y per le barre trasversali
   y_obs_min <- max_speed + 0.05 * speed_range
   y_obs_max <- max_speed + 0.15 * speed_range
   
   y_pred_min <- max_speed + 0.18 * speed_range
   y_pred_max <- max_speed + 0.28 * speed_range
   
-  # 5. Costruzione del Grafico ggplot2
+  # 5. Creazione Dataframe Unificato per gli Segmenti (Evita errori se 0 spike)
+  df_obs_spikes <- data.frame(
+    Time = time_sec[obs_spikes == 1],
+    ymin = y_obs_min,
+    ymax = y_obs_max,
+    Type = "Spike Osservato (Z = 1)"
+  )
+  
+  df_pred_spikes <- data.frame(
+    Time = time_sec[pred_spikes == 1],
+    ymin = y_pred_min,
+    ymax = y_pred_max,
+    Type = sprintf("Spike Predetto (P >= %.2f)", threshold)
+  )
+  
+  df_segments <- rbind(df_obs_spikes, df_pred_spikes)
+  
+  # 6. Rendering ggplot2
   p <- ggplot() +
-    # Traccia della Velocità (Grigio Scuro)
-    geom_line(data = df_speed, aes(x = Time, y = Speed), color = "#34495E", linewidth = 0.75) +
+    # Curve della Velocità (Grigio Scuro)
+    geom_line(data = df_speed, aes(x = Time, y = Speed), color = "#34495E", linewidth = 0.7) +
     
-    # Barre degli Spike OSSERVATI (Rosso)
+    # Layer delle barre degli Spike (Rosso = Osservato, Blu = Predetto)
     {
-      if (nrow(df_obs_spikes) > 0) {
+      if (nrow(df_segments) > 0) {
         geom_segment(
-          data = df_obs_spikes,
-          aes(x = Time, xend = Time, y = y_obs_min, yend = y_obs_max, color = "Spike Osservato (Z = 1)"),
-          linewidth = 0.75
+          data = df_segments,
+          aes(x = Time, xend = Time, y = ymin, yend = ymax, color = Type),
+          linewidth = 0.8
         )
       }
     } +
     
-    # Barre degli Spike PREDIETTI (Blu)
-    {
-      if (nrow(df_pred_spikes) > 0) {
-        geom_segment(
-          data = df_pred_spikes,
-          aes(x = Time, xend = Time, y = y_pred_min, yend = y_pred_max, color = "Spike Predetto (P >= Soglia)"),
-          linewidth = 0.75
-        )
-      }
-    } +
-    
-    # Scala Colori
     scale_color_manual(
       name = "Evento",
-      values = c(
-        "Spike Osservato (Z = 1)" = "#E74C3C",      # Rosso
-        "Spike Predetto (P >= Soglia)" = "#2980B9"  # Blu
+      values = setNames(
+        c("#E74C3C", "#2980B9"), 
+        c("Spike Osservato (Z = 1)", sprintf("Spike Predetto (P >= %.2f)", threshold))
       )
     ) +
     
     labs(
-      title = sprintf("Serie Temporale Velocità e Spike Events - Neurone %d", neuron_id),
-      subtitle = sprintf("Finestra temporale: %d - %d frame | Soglia P(Spike) = %.2f", start_frame, end_frame, threshold),
+      title = sprintf("Velocità vs. Spikes Realizzati e Predetti - Neurone %d", neuron_id),
+      subtitle = sprintf("Finestra: %d-%d frame | Soglia P(Spike) = %.2f | Predetti: %d | Osservati: %d", 
+                         start_frame, end_frame, threshold, nrow(df_pred_spikes), nrow(df_obs_spikes)),
       x = "Tempo (secondi)",
       y = "Velocità (cm/s)"
     ) +
     
     theme_minimal() +
     theme(
-      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
       plot.subtitle = element_text(size = 9.5, hjust = 0.5, color = "gray30"),
       axis.title = element_text(face = "bold", size = 10),
       panel.grid.minor = element_blank(),
