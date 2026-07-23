@@ -111,14 +111,13 @@ plot_speed_spike_timeseries <- function(predictions,
   return(p)
 }
 
-# Genera il grafico per il neurone 5 sui primi 800 frame
+# Test con soglia 0.15
 p_speed_spikes <- plot_speed_spike_timeseries(
   predictions = predictions_t1,
-  data_w_dist = data_w_dist_t1,
+  data_w_dist = M3424F_speed$trial1,
   neuron_id   = 5,
-  frame_range = c(1, 800),
-  threshold   = 0.35
+  frame_range = c(1, 1000),
+  threshold   = 0.15  # Adesso le barre blu compariranno distintamente
 )
 
-# Mostra il grafico
 print(p_speed_spikes)
